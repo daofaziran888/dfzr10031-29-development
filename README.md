@@ -62,6 +62,7 @@ npm run dev
 | 数据快照 | `snapshot` | 快照记录 | 快照编号、数据集名称、快照时间 |
 | 任务调度 | `scheduler` | 调度任务 | 任务编号、任务名称、调度类型 |
 | 缓存管理 | `cache` | 缓存配置 | 缓存编号、缓存目标、缓存策略 |
+| 缓存重建批次包 | `cache_warmup` | 缓存目标/重建批次/缓存条目 | 数据版本、可命中参数范围、有效期 |
 | 分析管道 | `pipeline` | 分析节点 | 节点编号、输入数据集、分析算子 |
 | 分析模型 | `model` | 模型配置 | 模型编号、模型名称、模型类型 |
 | 数据集市 | `data_mart` | 集市表 | 表编号、表名称、主题域 |
@@ -74,3 +75,38 @@ npm run dev
   `backend/app/routers/<模块>.py`，业务规则在 `backend/app/services/<模块>.py`。
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
+
+## 缓存重建批次包（cache_warmup）
+
+在缓存配置登记「缓存目标数据集 + 策略」的基础上，补齐按真实 OLAP 查询结果批量预热的能力。
+代码：`backend/app/services/cache_warmup.py`（领域规则）、
+`backend/app/routers/cache_warmup.py`（接口）、
+`frontend/src/views/cache_warmup/index.vue`（五个标签页的操作界面）。
+
+核心规则：
+
+1. **重建批次包**：`POST /api/cache-warmup/batches` 一次为多个目标按真实查询结果预热；
+   共享输入数据集 `shared_sales` 有两个数据版本 v1（更新前，总计 100）与 v2（更新后，总计 120）。
+2. **条目可追溯**：每条缓存条目保存实际结果、可命中参数范围（eq/in/range 谓词）、
+   来源批次、数据版本与有效期（created_at/expires_at）。
+3. **三道命中闸门**：`POST /api/cache-warmup/lookup` 必须同时满足参数范围匹配、
+   数据版本一致、未过有效期；别的参数、别的版本、过期条目都不能命中。
+4. **部分失败原子化**：同一批次某目标需生成条目数超过容量时，该目标整体不写入并标记
+   「超出容量」，同包其它目标照常完成。
+5. **联合查询同版对账**：`POST /api/cache-warmup/reconcile` 提供两种口径——
+   - `valid_combo`：继续使用仍有效的完整旧组合（新版仅总计完成时明确返回更新前的 100）；
+   - `same_batch_realtime`：以新版同一数据批次实时算出缺失分组（返回更新后的 120）。
+   两种口径都声明服务版本，且只在同一版本内把分组求和对回总计；
+   `GET /api/cache-warmup/mixed-guard` 显式展示跨版本混算被拦截。
+6. **同组整组提交**：`POST /api/cache-warmup/groups/{组名}/submit` 支持缓存入口多选目标、
+   一次提交，逐条返回已生成的数据版本与「暂未纳入」的目标。
+
+验证方式：
+
+```bash
+# 后端领域规则 + HTTP 冒烟测试（仅依赖标准库）
+cd backend && python3 -m unittest discover -s tests -v
+
+# 端到端场景演示（需先启动后端，脚本会先 /reset 再走六个场景）
+python3 scripts/demo_warmup.py
+```
